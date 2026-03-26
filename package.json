@@ -1,0 +1,18 @@
+{
+  "name": "vinyan-chrome-mcp",
+  "version": "0.1.0",
+  "description": "Stateless MCP Server for browser automation — Vinyan Cognitive OS component",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.3"
+  }
+}

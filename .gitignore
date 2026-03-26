@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Bun
+bun.lock
+bun.lockb
+
+# Build output
+dist/
+out/
+
+# TypeScript
+*.tsbuildinfo
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/
+
+# Screenshots
+screenshots/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
