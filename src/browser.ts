@@ -9,7 +9,7 @@ import { log, Mutex } from "./shared.js";
 const EPHEMERAL_TIMEOUT_MS = Number(process.env.SESSION_TTL_MS) || 120_000;
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 10;
 const PROFILE_DIR = process.env.CHROME_PROFILE_DIR
-  ?? join(homedir(), ".vinyan-chrome-mcp", "chrome-profile");
+  ?? join(homedir(), ".chome-bot-mcp", "chrome-profile");
 
 // ─── Stealth Scripts ─────────────────────────────────────────────────
 

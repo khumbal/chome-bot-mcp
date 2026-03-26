@@ -25,7 +25,7 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 // ─── Server ──────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "vinyan-chrome-mcp", version: "0.1.0" },
+  { name: "chome-bot-mcp", version: "0.1.0" },
   { capabilities: { tools: {} } },
 );
 

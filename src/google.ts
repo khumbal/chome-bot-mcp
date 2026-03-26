@@ -16,6 +16,11 @@ const GOOGLE_SESSION = "google";
 const SEARCH_TIMEOUT_MS = 30_000;
 const MAX_CONTENT_LENGTH = 5_000;
 
+interface Reference {
+  title: string;
+  url: string;
+}
+
 // Mutex prevents concurrent Google searches from interfering
 const googleMutex = new Mutex();
 let sessionCounter = 0;
@@ -127,10 +132,13 @@ async function tryAiMode(page: Page, query: string): Promise<ToolResult | null> 
     const content = await waitForAiModeResponse(page);
     if (!content) return null;
 
+    const references = await extractAiModeReferences(page);
+
     return ok(JSON.stringify({
       source: "google_ai_mode",
       query,
       content: truncate(content),
+      references,
     }, null, 2));
   } catch (err) {
     log.warn("AI Mode extraction failed, falling back", { error: formatError(err) });
@@ -149,10 +157,13 @@ async function tryAiOverview(page: Page, query: string): Promise<ToolResult | nu
 
   if (!content) return null;
 
+  const references = await extractSearchReferences(page);
+
   return ok(JSON.stringify({
     source: "google_ai_overview",
     query,
     content: truncate(content),
+    references,
   }, null, 2));
 }
 
@@ -160,10 +171,13 @@ async function trySearchResults(page: Page, query: string): Promise<ToolResult |
   const content = await extractFirstMatch(page, ["#rso", "#search"]);
   if (!content) return null;
 
+  const references = await extractSearchReferences(page);
+
   return ok(JSON.stringify({
     source: "google_search_results",
     query,
     content: truncate(content),
+    references,
     note: "AI Overview not available for this query. Returning top search results.",
   }, null, 2));
 }
@@ -190,6 +204,91 @@ async function extractFirstMatch(page: Page, selectors: string[]): Promise<strin
 function truncate(text: string): string {
   if (text.length <= MAX_CONTENT_LENGTH) return text;
   return text.substring(0, MAX_CONTENT_LENGTH) + `\n\n[truncated — ${text.length} total chars]`;
+}
+
+function cleanUrl(raw: string): string {
+  // Remove Google's text highlight fragment (#:~:text=...)
+  const idx = raw.indexOf("#:~:text=");
+  return idx !== -1 ? raw.substring(0, idx) : raw;
+}
+
+function extractDomain(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url.substring(0, 60);
+  }
+}
+
+/**
+ * Extract reference links from AI Mode response container.
+ * Collects inline links (class H23r4e) and citation links (class NDNGvf).
+ */
+async function extractAiModeReferences(page: Page): Promise<Reference[]> {
+  try {
+    const container = page.locator("#aim-chrome-initial-inline-async-container").first();
+    const exists = await container.isVisible({ timeout: 2_000 }).catch(() => false);
+    if (!exists) return [];
+
+    const rawLinks: { text: string; href: string }[] = await container.evaluate((el: Element) => {
+      const results: { text: string; href: string }[] = [];
+      el.querySelectorAll("a[href]").forEach((a) => {
+        const href = a.getAttribute("href") ?? "";
+        if (!href || href.startsWith("#") || href.startsWith("javascript:")) return;
+        if (href.includes("google.com/search") || href.includes("policies.google.com")) return;
+        results.push({ text: (a.textContent ?? "").trim(), href });
+      });
+      return results;
+    });
+
+    const seen = new Set<string>();
+    const refs: Reference[] = [];
+    for (const link of rawLinks) {
+      const url = cleanUrl(link.href);
+      if (seen.has(url)) continue;
+      seen.add(url);
+      refs.push({ title: link.text || extractDomain(url), url });
+    }
+    return refs;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Extract references from regular Google search results.
+ * Each .yuRUbf contains a result link with title + URL.
+ */
+async function extractSearchReferences(page: Page): Promise<Reference[]> {
+  try {
+    const rawLinks: { title: string; url: string }[] = await page.evaluate(() => {
+      const results: { title: string; url: string }[] = [];
+      document.querySelectorAll(".yuRUbf").forEach((wrapper) => {
+        const anchor = wrapper.querySelector("a[href]");
+        const heading = wrapper.querySelector("h3");
+        if (!anchor || !heading) return;
+        const href = anchor.getAttribute("href") ?? "";
+        if (!href || href.startsWith("#")) return;
+        results.push({
+          title: (heading.textContent ?? "").trim(),
+          url: href,
+        });
+      });
+      return results;
+    });
+
+    // Deduplicate
+    const seen = new Set<string>();
+    const refs: Reference[] = [];
+    for (const link of rawLinks) {
+      if (seen.has(link.url)) continue;
+      seen.add(link.url);
+      refs.push(link);
+    }
+    return refs;
+  } catch {
+    return [];
+  }
 }
 
 // ─── Google AI Mode (Direct) ─────────────────────────────────────────
@@ -228,12 +327,15 @@ export async function googleSearchAiMode(args: { query: string }): Promise<ToolR
         );
       }
 
+      const references = await extractAiModeReferences(page);
+
       return ok(
         JSON.stringify(
           {
             source: "google_ai_mode",
             query,
             content: truncate(content),
+            references,
           },
           null,
           2,
@@ -297,7 +399,7 @@ export const googleToolDefinitions = [
     description:
       "Search Google and extract the AI Overview / AI Mode summary for a given query. " +
       "Falls back to top search results if AI Overview is unavailable. " +
-      "Returns structured JSON with source type and content.",
+      "Returns structured JSON with source type, content, and reference links.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -311,7 +413,7 @@ export const googleToolDefinitions = [
     description:
       "Search Google using AI Mode directly (udm=50). Goes straight to Google's AI-generated answer " +
       "instead of regular search results. The response streams in and is captured once stable. " +
-      "Best for questions that benefit from AI synthesis. Returns structured JSON.",
+      "Best for questions that benefit from AI synthesis. Returns structured JSON with content and reference links.",
     inputSchema: {
       type: "object" as const,
       properties: {
