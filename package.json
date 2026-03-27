@@ -1,5 +1,5 @@
 {
-  "name": "chome-bot-mcp",
+  "name": "chrome-bot-mcp",
   "version": "0.1.0",
   "description": "Stateless MCP Server for browser automation — Vinyan Cognitive OS component",
   "type": "module",

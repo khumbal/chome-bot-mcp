@@ -12,6 +12,13 @@ import {
   geminiNewChat,
   geminiSummarizeYoutube,
 } from "./gemini.js";
+import {
+  searchToolDefinitions,
+  webFetchContent,
+  duckduckgoSearch,
+  newsSearch,
+  wikipediaSearch,
+} from "./search.js";
 import { browserManager } from "./browser.js";
 import { log, fail } from "./shared.js";
 
@@ -25,12 +32,12 @@ const SHUTDOWN_TIMEOUT_MS = 10_000;
 // ─── Server ──────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "chome-bot-mcp", version: "0.1.0" },
+  { name: "chrome-bot-mcp", version: "0.1.0" },
   { capabilities: { tools: {} } },
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [...toolDefinitions, ...googleToolDefinitions, ...geminiToolDefinitions],
+  tools: [...toolDefinitions, ...googleToolDefinitions, ...geminiToolDefinitions, ...searchToolDefinitions],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -49,6 +56,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return geminiNewChat();
       case "gemini_summarize_youtube":
         return geminiSummarizeYoutube(a as { youtubeUrl: string });
+      case "web_fetch_content":
+        return webFetchContent(a as { url: string; selector?: string });
+      case "duckduckgo_search":
+        return duckduckgoSearch(a as { query: string; maxResults?: number });
+      case "news_search":
+        return newsSearch(a as { query: string; maxResults?: number });
+      case "wikipedia_search":
+        return wikipediaSearch(a as { query: string; language?: string });
       default:
         return dispatchTool(name, a);
     }

@@ -1,4 +1,4 @@
-# chome-bot-mcp
+# chrome-bot-mcp
 
 MCP Server for browser automation — a component of the Vinyan Cognitive Operating System.
 
@@ -67,7 +67,7 @@ Gemini uses a single shared persistent session serialized with a mutex to preven
 
 ## Chrome Profile
 
-Chrome profile is persisted to `~/.chome-bot-mcp/chrome-profile` by default. This allows Google login state (for Gemini) to survive restarts. Override with `CHROME_PROFILE_DIR`.
+Chrome profile is persisted to `~/.chrome-bot-mcp/chrome-profile` by default. This allows Google login state (for Gemini) to survive restarts. Override with `CHROME_PROFILE_DIR`.
 
 ## Anti-Detection
 
@@ -86,7 +86,7 @@ This is required for Google and similar sites that aggressively detect headless/
 | `HEADLESS` | `false` | Set to `true` to run browser in headless mode. |
 | `SESSION_TTL_MS` | `120000` | Ephemeral session idle timeout in milliseconds. |
 | `MAX_SESSIONS` | `10` | Maximum number of concurrent browser sessions. |
-| `CHROME_PROFILE_DIR` | `~/.chome-bot-mcp/chrome-profile` | Path to persistent Chrome profile directory. |
+| `CHROME_PROFILE_DIR` | `~/.chrome-bot-mcp/chrome-profile` | Path to persistent Chrome profile directory. |
 | `GEMINI_TIMEOUT_MS` | `90000` | Timeout for waiting on Gemini responses in milliseconds. |
 
 ## MCP Client Config
@@ -96,9 +96,9 @@ Add to your MCP client configuration (e.g. Claude Desktop, VS Code):
 ```json
 {
   "mcpServers": {
-    "chome-bot-mcp": {
+    "chrome-bot-mcp": {
       "command": "bun",
-      "args": ["run", "/absolute/path/to/chome-bot-mcp/src/index.ts"]
+      "args": ["run", "/absolute/path/to/chrome-bot-mcp/src/index.ts"]
     }
   }
 }
