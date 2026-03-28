@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
-import { browserManager } from "./browser.js";
+import { browserManager, dismissCookieConsent, pageCache } from "./browser.js";
+import { extractReadableContent, extractLinks, cleanText, truncate } from "./content.js";
 import {
   type ToolResult,
   ok,
@@ -12,32 +13,17 @@ import {
   log,
 } from "./shared.js";
 
+import { googleSearchAiMode } from "./google.js";
+
 const SEARCH_TIMEOUT_MS = 30_000;
-const MAX_CONTENT_LENGTH = 8_000;
 
 // ─── Sessions ────────────────────────────────────────────────────────
 
-const DDG_SESSION = "duckduckgo";
-const NEWS_SESSION = "news-search";
 const WIKI_SESSION = "wikipedia";
 
 const ddgMutex = new Mutex();
 const newsMutex = new Mutex();
 const wikiMutex = new Mutex();
-
-async function ensureDdgPage(): Promise<Page> {
-  const existing = browserManager.getActivePage(DDG_SESSION);
-  if (existing) return existing;
-  const { page } = await browserManager.createPersistentSession(DDG_SESSION);
-  return page;
-}
-
-async function ensureNewsPage(): Promise<Page> {
-  const existing = browserManager.getActivePage(NEWS_SESSION);
-  if (existing) return existing;
-  const { page } = await browserManager.createPersistentSession(NEWS_SESSION);
-  return page;
-}
 
 async function ensureWikiPage(): Promise<Page> {
   const existing = browserManager.getActivePage(WIKI_SESSION);
@@ -51,10 +37,32 @@ async function ensureWikiPage(): Promise<Page> {
 export async function webFetchContent(args: {
   url: string;
   selector?: string;
+  includeLinks?: boolean;
+  skipCache?: boolean;
 }): Promise<ToolResult> {
   const sessionId = `web-fetch-${Date.now()}`;
   try {
     const parsed = validateUrl(args.url, "url");
+
+    // Check cache before creating a browser session
+    if (!args.skipCache && !args.selector) {
+      const cached = pageCache.get(parsed.href);
+      if (cached) {
+        log.debug("Page cache hit", { url: parsed.href });
+        const result: Record<string, unknown> = {
+          title: cached.title,
+          url: parsed.href,
+          ...(cached.author ? { author: cached.author } : {}),
+          ...(cached.date ? { date: cached.date } : {}),
+          ...(cached.siteName ? { siteName: cached.siteName } : {}),
+          content: cached.content,
+          wordCount: cached.wordCount,
+          cached: true,
+        };
+        return ok(JSON.stringify(result, null, 2));
+      }
+    }
+
     const { page } = await browserManager.createSession(sessionId);
 
     try {
@@ -64,43 +72,68 @@ export async function webFetchContent(args: {
       });
       await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
 
-      const title = await page.title().catch(() => "(untitled)");
-      const url = page.url();
+      // Dismiss cookie banners before extracting content
+      await dismissCookieConsent(page);
 
-      let content = "";
+      const url = page.url();
+      let result: Record<string, unknown>;
 
       if (args.selector) {
         const sel = validateNonEmpty(args.selector, "selector");
-        content =
+        const raw =
           (await page
             .locator(sel)
             .first()
             .textContent({ timeout: 5_000 })
             .catch(() => "")) ?? "";
+        const content = truncate(cleanText(raw));
+        const title = await page.title().catch(() => "(untitled)");
+        result = {
+          title,
+          url,
+          content,
+          wordCount: content.split(/\s+/).filter(Boolean).length,
+        };
       } else {
-        content = await extractArticleContent(page);
+        const readable = await extractReadableContent(page);
+        result = {
+          title: readable.title,
+          url,
+          ...(readable.author ? { author: readable.author } : {}),
+          ...(readable.date ? { date: readable.date } : {}),
+          ...(readable.siteName ? { siteName: readable.siteName } : {}),
+          content: readable.content,
+          wordCount: readable.wordCount,
+        };
       }
 
       // Fallback to full body if extraction returned too little text
-      if (content.trim().length < 50) {
-        content =
+      if (((result.content as string) ?? "").trim().length < 50) {
+        const raw =
           (await page.locator("body").textContent({ timeout: 5_000 }).catch(() => "")) ?? "";
+        const content = truncate(cleanText(raw));
+        result.content = content;
+        result.wordCount = content.split(/\s+/).filter(Boolean).length;
       }
 
-      const cleaned = cleanText(content);
+      if (args.includeLinks) {
+        const links = await extractLinks(page);
+        result.links = links;
+      }
 
-      return ok(
-        JSON.stringify(
-          {
-            title,
-            url,
-            content: truncate(cleaned),
-            wordCount: cleaned.split(/\s+/).filter(Boolean).length,
-          },
-          null,
-          2,
-        ),
-      );
+      // Cache for future reuse
+      if (!args.selector) {
+        pageCache.set(parsed.href, {
+          content: result.content as string,
+          title: result.title as string,
+          ...(result.author ? { author: result.author as string } : {}),
+          ...(result.date ? { date: result.date as string } : {}),
+          ...(result.siteName ? { siteName: result.siteName as string } : {}),
+          wordCount: result.wordCount as number,
+        });
+      }
+
+      return ok(JSON.stringify(result, null, 2));
     } finally {
       await browserManager.destroySession(sessionId).catch(() => {});
     }
@@ -113,22 +146,37 @@ export async function webFetchContent(args: {
 
 // ─── duckduckgo_search ───────────────────────────────────────────────
 
+type Recency = "day" | "week" | "month" | "year" | "any";
+
+const RECENCY_PARAM: Record<Recency, string> = {
+  day: "d",
+  week: "w",
+  month: "m",
+  year: "y",
+  any: "",
+};
+
 export async function duckduckgoSearch(args: {
   query: string;
   maxResults?: number;
+  recency?: Recency;
 }): Promise<ToolResult> {
+  const sessionId = `ddg-${Date.now()}`;
   try {
     const query = validateNonEmpty(args.query, "query");
     const maxResults = Math.max(1, Math.min(args.maxResults ?? 10, 20));
+    const recency = args.recency ?? "month";
+    const dfParam = RECENCY_PARAM[recency] ? `&df=${RECENCY_PARAM[recency]}` : "";
     const release = await ddgMutex.acquire();
 
     try {
-      const page = await ensureDdgPage();
-      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=wt-wt`;
+      const { page } = await browserManager.createSession(sessionId);
+      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=wt-wt${dfParam}`;
 
-      log.info("DuckDuckGo search", { query });
+      log.info("DuckDuckGo search", { query, recency });
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: SEARCH_TIMEOUT_MS });
       await page.waitForTimeout(1_500);
+      await dismissCookieConsent(page);
 
       const results = await page.evaluate((max: number) => {
         const items: { title: string; url: string; snippet: string }[] = [];
@@ -163,6 +211,7 @@ export async function duckduckgoSearch(args: {
         JSON.stringify(
           {
             query,
+            recency,
             totalResults: results.length,
             results,
           },
@@ -172,8 +221,10 @@ export async function duckduckgoSearch(args: {
       );
     } finally {
       release();
+      await browserManager.destroySession(sessionId).catch(() => {});
     }
   } catch (err) {
+    await browserManager.destroySession(sessionId).catch(() => {});
     if (err instanceof ValidationError) return fail(err.message);
     return fail(`duckduckgo_search: ${formatError(err)}`);
   }
@@ -184,20 +235,25 @@ export async function duckduckgoSearch(args: {
 export async function newsSearch(args: {
   query: string;
   maxResults?: number;
+  recency?: Recency;
 }): Promise<ToolResult> {
+  const sessionId = `news-${Date.now()}`;
   try {
     const query = validateNonEmpty(args.query, "query");
     const maxResults = Math.max(1, Math.min(args.maxResults ?? 10, 20));
+    const recency = args.recency ?? "week";
+    const dfParam = RECENCY_PARAM[recency] ? `&df=${RECENCY_PARAM[recency]}` : "";
     const release = await newsMutex.acquire();
 
     try {
-      const page = await ensureNewsPage();
+      const { page } = await browserManager.createSession(sessionId);
       // DuckDuckGo news filter — no CAPTCHA risk
-      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&iar=news&ia=news`;
+      const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&iar=news&ia=news${dfParam}`;
 
-      log.info("News search", { query });
+      log.info("News search", { query, recency });
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: SEARCH_TIMEOUT_MS });
       await page.waitForTimeout(1_500);
+      await dismissCookieConsent(page);
 
       const articles = await page.evaluate((max: number) => {
         const items: { title: string; url: string; snippet: string; source: string }[] = [];
@@ -233,6 +289,7 @@ export async function newsSearch(args: {
         JSON.stringify(
           {
             query,
+            recency,
             totalResults: articles.length,
             articles,
           },
@@ -242,8 +299,10 @@ export async function newsSearch(args: {
       );
     } finally {
       release();
+      await browserManager.destroySession(sessionId).catch(() => {});
     }
   } catch (err) {
+    await browserManager.destroySession(sessionId).catch(() => {});
     if (err instanceof ValidationError) return fail(err.message);
     return fail(`news_search: ${formatError(err)}`);
   }
@@ -335,37 +394,6 @@ export async function wikipediaSearch(args: {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-async function extractArticleContent(page: Page): Promise<string> {
-  const selectors = [
-    "article",
-    '[role="main"] article',
-    ".article-content",
-    ".article-body",
-    ".post-content",
-    ".entry-content",
-    ".content-body",
-    ".story-body",
-    ".article__body",
-    '[role="main"]',
-    "main",
-    "#content article",
-  ];
-
-  for (const sel of selectors) {
-    try {
-      const text = await page
-        .locator(sel)
-        .first()
-        .textContent({ timeout: 2_000 });
-      if (text && text.trim().length > 100) return text.trim();
-    } catch {
-      // Try next selector
-    }
-  }
-
-  return "";
-}
-
 async function extractWikipediaContent(page: Page): Promise<string> {
   try {
     const paragraphs = await page
@@ -385,18 +413,6 @@ async function extractWikipediaContent(page: Page): Promise<string> {
   }
 }
 
-function cleanText(text: string): string {
-  return text
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function truncate(text: string, max = MAX_CONTENT_LENGTH): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max) + `\n...[truncated at ${max} chars]`;
-}
-
 // ─── Tool Schemas (MCP ListTools) ────────────────────────────────────
 
 export const searchToolDefinitions = [
@@ -413,6 +429,14 @@ export const searchToolDefinitions = [
           description:
             "Optional CSS selector to extract a specific section. If omitted, auto-detects article content.",
         },
+        includeLinks: {
+          type: "boolean",
+          description: "Include a list of links found on the page (default: false). Saves a separate browser_list_links call.",
+        },
+        skipCache: {
+          type: "boolean",
+          description: "Skip the content cache and force a fresh fetch (default: false). Use when you need the latest version of a page.",
+        },
       },
       required: ["url"],
     },
@@ -420,7 +444,10 @@ export const searchToolDefinitions = [
   {
     name: "duckduckgo_search",
     description:
-      "Search the web using DuckDuckGo. Returns a list of results with title, clean URL, and snippet. Good for general web search without CAPTCHA friction. Use this as the primary web search tool.",
+      "Search the web using DuckDuckGo. Returns a list of results with title, clean URL, and snippet. " +
+      "Good as a supplementary search when Google is unavailable or rate-limited. " +
+      "For most queries, prefer google_search_ai_overview as the primary search tool. " +
+      "Defaults to results from the past month.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -429,6 +456,11 @@ export const searchToolDefinitions = [
           type: "number",
           description: "Max number of results to return (1–20, default: 10)",
         },
+        recency: {
+          type: "string",
+          enum: ["day", "week", "month", "year", "any"],
+          description: "Filter results by recency. Default: 'month'. Use 'any' to disable time filter.",
+        },
       },
       required: ["query"],
     },
@@ -436,7 +468,7 @@ export const searchToolDefinitions = [
   {
     name: "news_search",
     description:
-      "Search for recent news articles on a topic. Returns article titles, sources, URLs, and snippets. Powered by DuckDuckGo News.",
+      "Search for recent news articles on a topic. Returns article titles, sources, URLs, and snippets. Powered by DuckDuckGo News. Defaults to results from the past week.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -444,6 +476,11 @@ export const searchToolDefinitions = [
         maxResults: {
           type: "number",
           description: "Max number of articles to return (1–20, default: 10)",
+        },
+        recency: {
+          type: "string",
+          enum: ["day", "week", "month", "year", "any"],
+          description: "Filter news by recency. Default: 'week'. Use 'any' to disable time filter.",
         },
       },
       required: ["query"],
@@ -469,4 +506,163 @@ export const searchToolDefinitions = [
       required: ["query"],
     },
   },
+  {
+    name: "research",
+    description:
+      "Comprehensive multi-source research tool. Runs DuckDuckGo web search, DuckDuckGo news, Wikipedia, and Google AI Mode IN PARALLEL, " +
+      "then combines all results into a single structured report. Use this for any research query instead of calling individual search tools separately. " +
+      "Returns web results, news articles, Wikipedia summary, and AI-synthesized answer all at once. " +
+      "You can selectively enable/disable sources.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "The research topic or question" },
+        recency: {
+          type: "string",
+          enum: ["day", "week", "month", "year", "any"],
+          description: "Filter web/news results by recency. Default: 'month'.",
+        },
+        sources: {
+          type: "object",
+          description: "Enable/disable individual sources (all enabled by default)",
+          properties: {
+            web: { type: "boolean", description: "DuckDuckGo web search (default: true)" },
+            news: { type: "boolean", description: "DuckDuckGo news (default: true)" },
+            wikipedia: { type: "boolean", description: "Wikipedia lookup (default: true)" },
+            googleAi: { type: "boolean", description: "Google AI Mode (default: true)" },
+          },
+        },
+        maxResults: {
+          type: "number",
+          description: "Max results per source (1–10, default: 5)",
+        },
+        language: {
+          type: "string",
+          description: "Wikipedia language code (default: 'en'). Also affects Google hl param.",
+        },
+        deep: {
+          type: "boolean",
+          description: "Enable deep research mode (default: false). When true, fetches full content from top 3 web results and includes excerpts in the report.",
+        },
+      },
+      required: ["query"],
+    },
+  },
 ] as const;
+
+// ─── Research Meta-Tool ──────────────────────────────────────────────
+
+interface ResearchSources {
+  web?: boolean;
+  news?: boolean;
+  wikipedia?: boolean;
+  googleAi?: boolean;
+}
+
+export async function research(args: {
+  query: string;
+  recency?: Recency;
+  sources?: ResearchSources;
+  maxResults?: number;
+  language?: string;
+  deep?: boolean;
+}): Promise<ToolResult> {
+  try {
+    const query = validateNonEmpty(args.query, "query");
+    const recency = args.recency ?? "month";
+    const maxResults = Math.max(1, Math.min(args.maxResults ?? 5, 10));
+    const lang = args.language ?? "en";
+    const sources: Required<ResearchSources> = {
+      web: args.sources?.web ?? true,
+      news: args.sources?.news ?? true,
+      wikipedia: args.sources?.wikipedia ?? true,
+      googleAi: args.sources?.googleAi ?? true,
+    };
+
+    log.info("Research", { query, recency, sources, maxResults });
+
+    // Build parallel tasks based on enabled sources
+    const tasks: Record<string, Promise<unknown>> = {};
+
+    if (sources.web) {
+      tasks.web = duckduckgoSearch({ query, maxResults, recency })
+        .then(parseToolResult)
+        .catch((err) => ({ error: formatError(err) }));
+    }
+
+    if (sources.news) {
+      tasks.news = newsSearch({ query, maxResults, recency: recency === "month" ? "week" : recency })
+        .then(parseToolResult)
+        .catch((err) => ({ error: formatError(err) }));
+    }
+
+    if (sources.wikipedia) {
+      tasks.wikipedia = wikipediaSearch({ query, language: lang })
+        .then(parseToolResult)
+        .catch((err) => ({ error: formatError(err) }));
+    }
+
+    if (sources.googleAi) {
+      tasks.googleAi = googleSearchAiMode({ query, recency })
+        .then(parseToolResult)
+        .catch((err) => ({ error: formatError(err) }));
+    }
+
+    // Run all enabled sources in parallel
+    const keys = Object.keys(tasks);
+    const results = await Promise.all(Object.values(tasks));
+
+    const report: Record<string, unknown> = { query, recency, sourcesUsed: keys };
+
+    for (let i = 0; i < keys.length; i++) {
+      report[keys[i]] = results[i];
+    }
+
+    // Deep mode: fetch top URLs from web results for full content
+    if (args.deep && report.web && typeof report.web === "object") {
+      const webData = report.web as { results?: { url: string; title: string }[] };
+      const urls = (webData.results ?? [])
+        .map((r) => r.url)
+        .filter((url) => url && !url.includes("wikipedia.org"))
+        .slice(0, 3);
+
+      if (urls.length > 0) {
+        log.info("Deep research: fetching URLs", { count: urls.length });
+        const deepResults = await Promise.allSettled(
+          urls.map((url) =>
+            webFetchContent({ url, skipCache: false })
+              .then(parseToolResult)
+              .then((data) => {
+                const d = data as Record<string, unknown>;
+                return {
+                  url,
+                  title: (d.title as string) ?? "",
+                  excerpt: ((d.content as string) ?? "").slice(0, 2_000),
+                };
+              }),
+          ),
+        );
+
+        report.deepContent = deepResults
+          .filter((r): r is PromiseFulfilledResult<{ url: string; title: string; excerpt: string }> => r.status === "fulfilled")
+          .map((r) => r.value);
+      }
+    }
+
+    return ok(JSON.stringify(report, null, 2));
+  } catch (err) {
+    if (err instanceof ValidationError) return fail(err.message);
+    return fail(`research: ${formatError(err)}`);
+  }
+}
+
+function parseToolResult(result: ToolResult): unknown {
+  if (result.isError) {
+    return { error: result.content[0]?.text ?? "Unknown error" };
+  }
+  try {
+    return JSON.parse(result.content[0]?.text ?? "{}");
+  } catch {
+    return { text: result.content[0]?.text ?? "" };
+  }
+}

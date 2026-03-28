@@ -18,6 +18,7 @@ import {
   duckduckgoSearch,
   newsSearch,
   wikipediaSearch,
+  research,
 } from "./search.js";
 import { browserManager } from "./browser.js";
 import { log, fail } from "./shared.js";
@@ -47,9 +48,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "google_search_ai_overview":
-        return googleSearchAiOverview(a as { query: string });
+        return googleSearchAiOverview(a as { query: string; recency?: "day" | "week" | "month" | "year" | "any" });
       case "google_search_ai_mode":
-        return googleSearchAiMode(a as { query: string });
+        return googleSearchAiMode(a as { query: string; recency?: "day" | "week" | "month" | "year" | "any" });
       case "gemini_chat":
         return geminiChat(a as { message: string });
       case "gemini_new_chat":
@@ -57,13 +58,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "gemini_summarize_youtube":
         return geminiSummarizeYoutube(a as { youtubeUrl: string });
       case "web_fetch_content":
-        return webFetchContent(a as { url: string; selector?: string });
+        return webFetchContent(a as { url: string; selector?: string; includeLinks?: boolean; skipCache?: boolean });
       case "duckduckgo_search":
         return duckduckgoSearch(a as { query: string; maxResults?: number });
       case "news_search":
         return newsSearch(a as { query: string; maxResults?: number });
       case "wikipedia_search":
         return wikipediaSearch(a as { query: string; language?: string });
+      case "research":
+        return research(a as { query: string; recency?: "day" | "week" | "month" | "year" | "any"; sources?: { web?: boolean; news?: boolean; wikipedia?: boolean; googleAi?: boolean }; maxResults?: number; language?: string; deep?: boolean });
       default:
         return dispatchTool(name, a);
     }

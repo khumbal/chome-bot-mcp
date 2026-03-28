@@ -39,6 +39,116 @@ interface Session {
   persistent: boolean;
 }
 
+// ─── Cookie Consent Auto-Dismiss ─────────────────────────────────────
+
+const COOKIE_SELECTORS = [
+  "#onetrust-accept-btn-handler",
+  '[data-testid="cookie-accept"]',
+  "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+  ".fc-cta-consent",
+  ".cc-accept",
+  ".cc-btn.cc-allow",
+];
+
+const COOKIE_TEXT_PATTERNS = [
+  "Accept all",
+  "Accept cookies",
+  "Allow all",
+  "Allow cookies",
+  "I agree",
+  "Agree",
+  "OK",
+];
+
+export async function dismissCookieConsent(page: Page): Promise<void> {
+  try {
+    // Try CSS selectors first (faster)
+    for (const sel of COOKIE_SELECTORS) {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
+        await el.click({ timeout: 1_000 }).catch(() => {});
+        log.debug("Cookie consent dismissed via selector", { selector: sel });
+        return;
+      }
+    }
+    // Try text-based button matching
+    for (const text of COOKIE_TEXT_PATTERNS) {
+      const btn = page.locator(`button:has-text("${text}"), a:has-text("${text}")`).first();
+      if (await btn.isVisible({ timeout: 300 }).catch(() => false)) {
+        await btn.click({ timeout: 1_000 }).catch(() => {});
+        log.debug("Cookie consent dismissed via text", { text });
+        return;
+      }
+    }
+  } catch {
+    // Best-effort — never fail
+  }
+}
+
+// ─── Page Content Cache ──────────────────────────────────────────────
+
+const PAGE_CACHE_TTL_MS = Number(process.env.PAGE_CACHE_TTL_MS) || 5 * 60_000;
+const PAGE_CACHE_MAX_ENTRIES = 50;
+
+export interface CachedPage {
+  content: string;
+  title: string;
+  author?: string;
+  date?: string;
+  siteName?: string;
+  wordCount: number;
+  fetchedAt: number;
+}
+
+export class PageCache {
+  private cache = new Map<string, CachedPage>();
+
+  private normalizeUrl(url: string): string {
+    try {
+      const u = new URL(url);
+      u.hash = "";
+      u.hostname = u.hostname.toLowerCase();
+      return u.href;
+    } catch {
+      return url;
+    }
+  }
+
+  get(url: string): CachedPage | undefined {
+    const key = this.normalizeUrl(url);
+    const entry = this.cache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() - entry.fetchedAt > PAGE_CACHE_TTL_MS) {
+      this.cache.delete(key);
+      return undefined;
+    }
+    // Move to end (LRU)
+    this.cache.delete(key);
+    this.cache.set(key, entry);
+    return entry;
+  }
+
+  set(url: string, data: Omit<CachedPage, "fetchedAt">): void {
+    const key = this.normalizeUrl(url);
+    // Evict oldest if at capacity
+    if (this.cache.size >= PAGE_CACHE_MAX_ENTRIES && !this.cache.has(key)) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) this.cache.delete(oldestKey);
+    }
+    this.cache.set(key, { ...data, fetchedAt: Date.now() });
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  get size(): number {
+    return this.cache.size;
+  }
+}
+
+export const pageCache = new PageCache();
+
 // ─── Browser Launch Options ──────────────────────────────────────────
 
 function launchArgs(): string[] {

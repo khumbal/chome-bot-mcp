@@ -25,6 +25,21 @@ interface Reference {
 const googleMutex = new Mutex();
 let sessionCounter = 0;
 
+type GoogleRecency = "day" | "week" | "month" | "year" | "any";
+
+const GOOGLE_RECENCY_PARAM: Record<GoogleRecency, string> = {
+  day: "qdr:d",
+  week: "qdr:w",
+  month: "qdr:m",
+  year: "qdr:y",
+  any: "",
+};
+
+function buildTbsParam(recency: GoogleRecency): string {
+  const val = GOOGLE_RECENCY_PARAM[recency];
+  return val ? `&tbs=${val}` : "";
+}
+
 // ─── Shared Google Session ───────────────────────────────────────────
 
 async function ensureGooglePage(): Promise<Page> {
@@ -39,16 +54,17 @@ async function ensureGooglePage(): Promise<Page> {
 
 // ─── Google AI Overview ──────────────────────────────────────────────
 
-export async function googleSearchAiOverview(args: { query: string }): Promise<ToolResult> {
+export async function googleSearchAiOverview(args: { query: string; recency?: GoogleRecency }): Promise<ToolResult> {
   try {
     const query = validateNonEmpty(args.query, "query");
+    const recency = args.recency ?? "month";
     const release = await googleMutex.acquire();
 
     try {
       const page = await ensureGooglePage();
 
-      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en`;
-      log.info("Google search", { query });
+      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=en${buildTbsParam(recency)}`;
+      log.info("Google search", { query, recency });
 
       await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: SEARCH_TIMEOUT_MS });
       await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
@@ -61,15 +77,15 @@ export async function googleSearchAiOverview(args: { query: string }): Promise<T
         return fail(captchaResult);
       }
 
-      // Strategy 1: Click AI Mode tab
-      const aiModeResult = await tryAiMode(page, query);
-      if (aiModeResult) return aiModeResult;
-
-      // Strategy 2: Extract AI Overview / Featured Snippet from results page
+      // Strategy 1: Extract AI Overview / Featured Snippet from results page
       const overviewResult = await tryAiOverview(page, query);
       if (overviewResult) return overviewResult;
 
-      // Strategy 3: Fallback to search results
+      // Strategy 2: Click AI Mode tab (fallback if no AI Overview)
+      const aiModeResult = await tryAiMode(page, query);
+      if (aiModeResult) return aiModeResult;
+
+      // Strategy 3: Fallback to regular search results
       const fallbackResult = await trySearchResults(page, query);
       if (fallbackResult) return fallbackResult;
 
@@ -296,17 +312,18 @@ async function extractSearchReferences(page: Page): Promise<Reference[]> {
 const AI_MODE_TIMEOUT_MS = 60_000;
 const AI_MODE_POLL_MS = 1_500;
 
-export async function googleSearchAiMode(args: { query: string }): Promise<ToolResult> {
+export async function googleSearchAiMode(args: { query: string; recency?: GoogleRecency }): Promise<ToolResult> {
   try {
     const query = validateNonEmpty(args.query, "query");
+    const recency = args.recency ?? "month";
     const release = await googleMutex.acquire();
 
     try {
       const page = await ensureGooglePage();
 
       // udm=50 goes directly to Google AI Mode
-      const aiModeUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&udm=50&hl=en`;
-      log.info("Google AI Mode search", { query });
+      const aiModeUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&udm=50&hl=en${buildTbsParam(recency)}`;
+      log.info("Google AI Mode search", { query, recency });
 
       await page.goto(aiModeUrl, { waitUntil: "domcontentloaded", timeout: SEARCH_TIMEOUT_MS });
 
@@ -397,13 +414,19 @@ export const googleToolDefinitions = [
   {
     name: "google_search_ai_overview",
     description:
-      "Search Google and extract the AI Overview / AI Mode summary for a given query. " +
-      "Falls back to top search results if AI Overview is unavailable. " +
-      "Returns structured JSON with source type, content, and reference links.",
+      "PRIMARY search tool. Search Google and extract the AI Overview summary for a given query. " +
+      "Tries AI Overview first, then AI Mode, then top search results as fallback. " +
+      "Use this as the default search tool for most queries. " +
+      "Returns structured JSON with source type, content, and reference links. Default: results from past month.",
     inputSchema: {
       type: "object" as const,
       properties: {
         query: { type: "string", description: "The search query (non-empty string)" },
+        recency: {
+          type: "string",
+          enum: ["day", "week", "month", "year", "any"],
+          description: "Filter results by recency. Default: 'month'. Use 'any' for all-time results.",
+        },
       },
       required: ["query"],
     },
@@ -413,11 +436,18 @@ export const googleToolDefinitions = [
     description:
       "Search Google using AI Mode directly (udm=50). Goes straight to Google's AI-generated answer " +
       "instead of regular search results. The response streams in and is captured once stable. " +
-      "Best for questions that benefit from AI synthesis. Returns structured JSON with content and reference links.",
+      "Use when you specifically need AI Mode's deeper synthesis (e.g. complex multi-step questions). " +
+      "For most queries, prefer google_search_ai_overview instead. " +
+      "Returns structured JSON with content and reference links. Default: results from past month.",
     inputSchema: {
       type: "object" as const,
       properties: {
         query: { type: "string", description: "The search query (non-empty string)" },
+        recency: {
+          type: "string",
+          enum: ["day", "week", "month", "year", "any"],
+          description: "Filter results by recency. Default: 'month'. Use 'any' for all-time results.",
+        },
       },
       required: ["query"],
     },
