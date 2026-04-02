@@ -7,6 +7,7 @@ import { log, Mutex } from "./shared.js";
 // ─── Configuration ───────────────────────────────────────────────────
 
 const EPHEMERAL_TIMEOUT_MS = Number(process.env.SESSION_TTL_MS) || 120_000;
+const PERSISTENT_TIMEOUT_MS = Number(process.env.PERSISTENT_SESSION_TTL_MS) || 10 * 60_000;
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 10;
 const PROFILE_DIR = process.env.CHROME_PROFILE_DIR
   ?? join(homedir(), ".chrome-bot-mcp", "chrome-profile");
@@ -175,6 +176,7 @@ function contextOptions() {
 
 class BrowserManager {
   private browser: Browser | null = null;
+  private persistentContext: BrowserContext | null = null;
   private sessions = new Map<string, Session>();
   private cleanupTimer: Timer | null = null;
   private headless: boolean;
@@ -182,6 +184,7 @@ class BrowserManager {
 
   // Mutexes to prevent concurrent browser/session creation races
   private browserMutex = new Mutex();
+  private persistentContextMutex = new Mutex();
   private sessionMutexes = new Map<string, Mutex>();
 
   constructor(headless = true) {
@@ -211,7 +214,11 @@ class BrowserManager {
 
       // Handle unexpected browser disconnection
       this.browser.on("disconnected", () => {
-        log.warn("Browser disconnected unexpectedly");
+        if (this.shuttingDown) {
+          log.info("Shared browser disconnected during shutdown");
+        } else {
+          log.warn("Shared browser disconnected unexpectedly");
+        }
         this.browser = null;
         // Remove all non-persistent sessions (collect IDs first to avoid delete-during-iterate)
         const toRemove = Array.from(this.sessions.entries())
@@ -274,24 +281,15 @@ class BrowserManager {
         await this.destroySessionInternal(id);
       }
 
-      // Ensure profile directory exists
-      mkdirSync(PROFILE_DIR, { recursive: true });
-
-      log.info("Launching persistent session", { id, profileDir: PROFILE_DIR });
-      const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-        headless: this.headless,
-        channel: "chrome",
-        args: launchArgs(),
-        ...contextOptions(),
-      });
-      await context.addInitScript(STEALTH_SCRIPTS);
-
-      const page = context.pages()[0] ?? await context.newPage();
+      const context = await this.ensurePersistentContext();
+      const page = this.countPersistentSessions() === 0
+        ? (context.pages()[0] ?? await context.newPage())
+        : await context.newPage();
       this.installPageGuards(page, id);
 
       const now = Date.now();
       this.sessions.set(id, { context, page, createdAt: now, lastUsedAt: now, persistent: true });
-      log.debug("Persistent session created", { id });
+      log.info("Persistent session ready", { id, totalPersistentSessions: this.countPersistentSessions() });
       return { context, page };
     } finally {
       release();
@@ -349,6 +347,22 @@ class BrowserManager {
     if (!session) return;
 
     log.debug("Destroying session", { id, persistent: session.persistent });
+    if (session.persistent) {
+      this.sessions.delete(id);
+      try {
+        if (!session.page.isClosed()) {
+          await session.page.close();
+        }
+      } catch {
+        // Already closed — ignore
+      }
+
+      if (this.countPersistentSessions() === 0) {
+        await this.closePersistentContext();
+      }
+      return;
+    }
+
     try {
       await session.context.close();
     } catch {
@@ -374,6 +388,8 @@ class BrowserManager {
       this.destroySessionInternal(id),
     );
     await Promise.allSettled(destroyPromises);
+
+    await this.closePersistentContext();
 
     if (this.browser) {
       try {
@@ -403,8 +419,74 @@ class BrowserManager {
       this.sessions.delete(sessionId);
     });
     page.on("close", () => {
+      const current = this.sessions.get(sessionId);
+      if (current?.page === page) {
+        this.sessions.delete(sessionId);
+      }
       log.debug("Page closed", { sessionId });
     });
+  }
+
+  private async ensurePersistentContext(): Promise<BrowserContext> {
+    if (this.persistentContext) return this.persistentContext;
+
+    const release = await this.persistentContextMutex.acquire();
+    try {
+      if (this.persistentContext) return this.persistentContext;
+
+      mkdirSync(PROFILE_DIR, { recursive: true });
+
+      log.info("Launching shared persistent browser context", {
+        profileDir: PROFILE_DIR,
+        headless: this.headless,
+      });
+
+      const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+        headless: this.headless,
+        channel: "chrome",
+        args: launchArgs(),
+        ...contextOptions(),
+      });
+      await context.addInitScript(STEALTH_SCRIPTS);
+
+      context.on("close", () => {
+        if (this.shuttingDown) {
+          log.info("Persistent browser context closed during shutdown");
+        } else {
+          log.warn("Persistent browser context closed unexpectedly");
+        }
+        this.persistentContext = null;
+        const toRemove = Array.from(this.sessions.entries())
+          .filter(([, session]) => session.persistent)
+          .map(([id]) => id);
+        for (const id of toRemove) {
+          this.sessions.delete(id);
+        }
+      });
+
+      this.persistentContext = context;
+      this.startCleanupLoop();
+      return context;
+    } finally {
+      release();
+    }
+  }
+
+  private async closePersistentContext(): Promise<void> {
+    if (!this.persistentContext) return;
+
+    const context = this.persistentContext;
+    this.persistentContext = null;
+
+    try {
+      await context.close();
+    } catch {
+      // Already closed — ignore
+    }
+  }
+
+  private countPersistentSessions(): number {
+    return Array.from(this.sessions.values()).filter((session) => session.persistent).length;
   }
 
   private startCleanupLoop(): void {
@@ -415,15 +497,29 @@ class BrowserManager {
   private async reapStale(): Promise<void> {
     const now = Date.now();
     for (const [id, session] of this.sessions) {
-      if (session.persistent) continue;
-
-      const expired = now - session.lastUsedAt > EPHEMERAL_TIMEOUT_MS;
+      const timeout = session.persistent ? PERSISTENT_TIMEOUT_MS : EPHEMERAL_TIMEOUT_MS;
+      const expired = now - session.lastUsedAt > timeout;
       const dead = !this.isPageAlive(session.page);
 
       if (expired || dead) {
-        log.debug("Reaping session", { id, expired, dead });
+        log.debug("Reaping session", { id, expired, dead, persistent: session.persistent });
         await this.destroySessionInternal(id);
       }
+    }
+
+    // Auto-close browser when no sessions remain
+    if (this.sessions.size === 0 && this.browser) {
+      log.debug("No active sessions — closing browser");
+      if (this.cleanupTimer) {
+        clearInterval(this.cleanupTimer);
+        this.cleanupTimer = null;
+      }
+      try {
+        await this.browser.close();
+      } catch {
+        // Already closed
+      }
+      this.browser = null;
     }
   }
 

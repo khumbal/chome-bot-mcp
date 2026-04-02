@@ -63,7 +63,18 @@ Gemini tools use a **persistent browser session** backed by a saved Chrome profi
 
 Every browser tool accepts an optional `sessionId`. Each session maps to an isolated Playwright `BrowserContext` — no cookies, localStorage, or state is shared between sessions. Ephemeral sessions auto-expire after 120 seconds of inactivity (configurable via `SESSION_TTL_MS`).
 
-Gemini uses a single shared persistent session serialized with a mutex to prevent concurrent access.
+Google-, Gemini-, and other login-backed flows now reuse a single shared persistent Chrome context backed by the saved profile. Each logical persistent session gets its own page inside that shared context, so cookies/login state are reused without launching multiple Chromium profile instances against the same profile directory.
+
+## Recommended Workflow
+
+For research-heavy usage, prefer the higher-level tools before opening many manual browser sessions:
+
+1. Use `google_search_ai_overview` for most one-shot web lookups.
+2. Use `research` when you need a combined web/news/Wikipedia/Google AI report in one call.
+3. Use `google_search_ai_mode` only when you specifically need Google's AI Mode output.
+4. Use manual `browser_*` tools for interactive navigation/debugging, then inspect with `browser_list_sessions` and close long-lived sessions with `browser_close_session` when you are done.
+
+This keeps the shared Google login session stable and avoids unnecessary browser/process churn during repeated searches.
 
 ## Chrome Profile
 
