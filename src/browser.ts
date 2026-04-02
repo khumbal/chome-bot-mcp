@@ -180,6 +180,9 @@ class BrowserManager {
   private sessions = new Map<string, Session>();
   private cleanupTimer: Timer | null = null;
   private headless: boolean;
+  // Ephemeral browser (DDG, news, web-fetch) is headless by default since auth is not needed.
+  // Set EPHEMERAL_HEADLESS=false only when you need visible windows for manual browser tools.
+  private ephemeralHeadless: boolean = true;
   private shuttingDown = false;
 
   // Mutexes to prevent concurrent browser/session creation races
@@ -195,6 +198,10 @@ class BrowserManager {
     this.headless = value;
   }
 
+  setEphemeralHeadless(value: boolean): void {
+    this.ephemeralHeadless = value;
+  }
+
   // ─── Browser Lifecycle ───────────────────────────────────────────
 
   async ensureBrowser(): Promise<Browser> {
@@ -205,9 +212,9 @@ class BrowserManager {
       // Double-check after acquiring lock
       if (this.browser?.isConnected()) return this.browser;
 
-      log.info("Launching browser", { headless: this.headless });
+      log.info("Launching browser", { headless: this.ephemeralHeadless });
       this.browser = await chromium.launch({
-        headless: this.headless,
+        headless: this.ephemeralHeadless,
         channel: "chrome",
         args: launchArgs(),
       });

@@ -26,7 +26,9 @@ import { log, fail } from "./shared.js";
 // ─── Configuration ───────────────────────────────────────────────────
 
 const headless = process.env.HEADLESS === "true";
+const ephemeralHeadless = process.env.EPHEMERAL_HEADLESS !== "false"; // default true
 browserManager.setHeadless(headless);
+browserManager.setEphemeralHeadless(ephemeralHeadless);
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
@@ -125,6 +127,7 @@ async function main(): Promise<void> {
 
   log.info("MCP server started", {
     headless,
+    ephemeralHeadless,
     maxSessions: process.env.MAX_SESSIONS || "10",
     logLevel: process.env.LOG_LEVEL || "info",
   });
