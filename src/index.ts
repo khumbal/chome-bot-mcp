@@ -5,7 +5,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { toolDefinitions, dispatchTool } from "./tools.js";
-import { googleToolDefinitions, googleSearchAiOverview, googleSearchAiMode } from "./google.js";
+import { googleToolDefinitions, googleSearchAiOverview, googleSearchAiMode, type GoogleSearchArgs } from "./google.js";
 import {
   geminiToolDefinitions,
   geminiChat,
@@ -21,7 +21,7 @@ import {
   research,
 } from "./search.js";
 import { browserManager } from "./browser.js";
-import { log, fail } from "./shared.js";
+import { type ToolResult, log, fail } from "./shared.js";
 
 // ─── Configuration ───────────────────────────────────────────────────
 
@@ -32,6 +32,52 @@ browserManager.setEphemeralHeadless(ephemeralHeadless);
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
+type ToolArgs = Record<string, unknown>;
+type ToolHandler = (args: ToolArgs) => Promise<ToolResult>;
+
+const allToolDefinitions = [
+  ...toolDefinitions,
+  ...googleToolDefinitions,
+  ...geminiToolDefinitions,
+  ...searchToolDefinitions,
+];
+
+const directToolHandlers: Record<string, ToolHandler> = {
+  google_search_ai_overview: (args) => googleSearchAiOverview(args as GoogleSearchArgs),
+  google_search_ai_mode: (args) => googleSearchAiMode(args as GoogleSearchArgs),
+  gemini_chat: (args) => geminiChat(args as Parameters<typeof geminiChat>[0]),
+  gemini_new_chat: () => geminiNewChat(),
+  gemini_summarize_youtube: (args) => geminiSummarizeYoutube(args as Parameters<typeof geminiSummarizeYoutube>[0]),
+  web_fetch_content: (args) => webFetchContent(args as Parameters<typeof webFetchContent>[0]),
+  duckduckgo_search: (args) => duckduckgoSearch(args as Parameters<typeof duckduckgoSearch>[0]),
+  news_search: (args) => newsSearch(args as Parameters<typeof newsSearch>[0]),
+  wikipedia_search: (args) => wikipediaSearch(args as Parameters<typeof wikipediaSearch>[0]),
+  research: (args) => research(args as Parameters<typeof research>[0]),
+};
+
+function assertUniqueToolNames(definitions: readonly { name: string }[]): void {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+
+  for (const definition of definitions) {
+    if (seen.has(definition.name)) {
+      duplicates.add(definition.name);
+      continue;
+    }
+    seen.add(definition.name);
+  }
+
+  if (duplicates.size > 0) {
+    throw new Error(`Duplicate MCP tool names: ${Array.from(duplicates).join(", ")}`);
+  }
+}
+
+async function dispatchMcpTool(name: string, args: ToolArgs): Promise<ToolResult> {
+  const handler = directToolHandlers[name];
+  if (handler) return handler(args);
+  return dispatchTool(name, args);
+}
+
 // ─── Server ──────────────────────────────────────────────────────────
 
 const server = new Server(
@@ -40,7 +86,7 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [...toolDefinitions, ...googleToolDefinitions, ...geminiToolDefinitions, ...searchToolDefinitions],
+  tools: allToolDefinitions,
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -48,30 +94,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const a = (args ?? {}) as Record<string, unknown>;
 
   try {
-    switch (name) {
-      case "google_search_ai_overview":
-        return googleSearchAiOverview(a as { query: string; recency?: "day" | "week" | "month" | "year" | "any" });
-      case "google_search_ai_mode":
-        return googleSearchAiMode(a as { query: string; recency?: "day" | "week" | "month" | "year" | "any" });
-      case "gemini_chat":
-        return geminiChat(a as { message: string });
-      case "gemini_new_chat":
-        return geminiNewChat();
-      case "gemini_summarize_youtube":
-        return geminiSummarizeYoutube(a as { youtubeUrl: string });
-      case "web_fetch_content":
-        return webFetchContent(a as { url: string; selector?: string; includeLinks?: boolean; skipCache?: boolean });
-      case "duckduckgo_search":
-        return duckduckgoSearch(a as { query: string; maxResults?: number });
-      case "news_search":
-        return newsSearch(a as { query: string; maxResults?: number });
-      case "wikipedia_search":
-        return wikipediaSearch(a as { query: string; language?: string });
-      case "research":
-        return research(a as { query: string; recency?: "day" | "week" | "month" | "year" | "any"; sources?: { web?: boolean; news?: boolean; wikipedia?: boolean; googleAi?: boolean }; maxResults?: number; language?: string; deep?: boolean });
-      default:
-        return dispatchTool(name, a);
-    }
+    return dispatchMcpTool(name, a);
   } catch (err) {
     log.error("Unhandled tool error", { tool: name, error: String(err) });
     return fail(`Internal error in tool "${name}". Check server logs.`);
@@ -122,6 +145,8 @@ process.on("uncaughtException", (err) => {
 // ─── Main ────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  assertUniqueToolNames(allToolDefinitions);
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
@@ -130,6 +155,7 @@ async function main(): Promise<void> {
     ephemeralHeadless,
     maxSessions: process.env.MAX_SESSIONS || "10",
     logLevel: process.env.LOG_LEVEL || "info",
+    tools: allToolDefinitions.length,
   });
 }
 

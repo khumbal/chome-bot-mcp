@@ -582,33 +582,25 @@ export const toolDefinitions = [
 
 // ─── Tool Dispatcher ─────────────────────────────────────────────────
 
+type BrowserToolHandler = (args: Record<string, unknown>) => Promise<ToolResult>;
+
+const browserToolHandlers: Record<string, BrowserToolHandler> = {
+  browser_navigate: (args) => browserNavigate(args as Parameters<typeof browserNavigate>[0]),
+  browser_click: (args) => browserClick(args as Parameters<typeof browserClick>[0]),
+  browser_fill: (args) => browserFill(args as Parameters<typeof browserFill>[0]),
+  browser_press_key: (args) => browserPressKey(args as Parameters<typeof browserPressKey>[0]),
+  browser_extract_text: (args) => browserExtractText(args as Parameters<typeof browserExtractText>[0]),
+  browser_get_dom_state: (args) => browserGetDomState(args as Parameters<typeof browserGetDomState>[0]),
+  browser_screenshot: (args) => browserScreenshot(args as Parameters<typeof browserScreenshot>[0]),
+  browser_extract_structured: (args) => browserExtractStructured(args as Parameters<typeof browserExtractStructured>[0]),
+  browser_wait: (args) => browserWait(args as Parameters<typeof browserWait>[0]),
+  browser_close_session: (args) => browserCloseSession(args as Parameters<typeof browserCloseSession>[0]),
+  browser_list_sessions: () => browserListSessions(),
+  browser_list_links: (args) => browserListLinks(args as Parameters<typeof browserListLinks>[0]),
+};
+
 export async function dispatchTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  switch (name) {
-    case "browser_navigate":
-      return browserNavigate(args as { url: string; sessionId?: string });
-    case "browser_click":
-      return browserClick(args as { selector: string; sessionId?: string });
-    case "browser_fill":
-      return browserFill(args as { selector: string; text: string; sessionId?: string });
-    case "browser_press_key":
-      return browserPressKey(args as { key: string; sessionId?: string });
-    case "browser_extract_text":
-      return browserExtractText(args as { selector: string; sessionId?: string });
-    case "browser_get_dom_state":
-      return browserGetDomState(args as { sessionId?: string; selector?: string; mode?: "full" | "interactive" | "headings"; maxLength?: number });
-    case "browser_screenshot":
-      return browserScreenshot(args as { fullPage?: boolean; describe?: boolean; sessionId?: string });
-    case "browser_extract_structured":
-      return browserExtractStructured(args as { selector: string; fields: Record<string, string>; maxResults?: number; sessionId?: string });
-    case "browser_wait":
-      return browserWait(args as { milliseconds?: number; selector?: string; sessionId?: string });
-    case "browser_close_session":
-      return browserCloseSession(args as { sessionId?: string });
-    case "browser_list_sessions":
-      return browserListSessions();
-    case "browser_list_links":
-      return browserListLinks(args as { selector?: string; filter?: "internal" | "external" | "all"; maxResults?: number; sessionId?: string });
-    default:
-      return fail(`Unknown tool: "${name}". Use browser_list_sessions to see available tools.`);
-  }
+  const handler = browserToolHandlers[name];
+  if (!handler) return fail(`Unknown tool: "${name}". Use browser_list_sessions to see available tools.`);
+  return handler(args);
 }

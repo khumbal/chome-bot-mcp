@@ -331,24 +331,33 @@ export async function wikipediaSearch(args: {
       const currentUrl = page.url();
       const title = await page.title().catch(() => "(untitled)");
 
-      // Redirected directly to an article
+      // Redirected directly to an article (but not a "does not exist" page)
       if (!currentUrl.includes("Special:Search")) {
-        const content = await extractWikipediaContent(page);
-        return ok(
-          JSON.stringify(
-            {
-              title,
-              url: currentUrl,
-              type: "article",
-              content: truncate(content),
-            },
-            null,
-            2,
-          ),
-        );
+        const isNoArticle = await page.evaluate(() => !!document.querySelector(".noarticletext, #noarticletext")).catch(() => false);
+
+        if (!isNoArticle) {
+          const content = await extractWikipediaContent(page);
+          return ok(
+            JSON.stringify(
+              {
+                title,
+                url: currentUrl,
+                type: "article",
+                content: truncate(content),
+              },
+              null,
+              2,
+            ),
+          );
+        }
+
+        // Page doesn't exist — fall back to fulltext search
+        const fallbackUrl = `https://${lang}.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(query)}&ns0=1&fulltext=1`;
+        await page.goto(fallbackUrl, { waitUntil: "domcontentloaded", timeout: SEARCH_TIMEOUT_MS });
+        await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
       }
 
-      // Returned a search results list
+      // Search results list
       const results = await page.evaluate(() => {
         const items: { title: string; url: string; snippet: string }[] = [];
         const resultEls = document.querySelectorAll(".mw-search-result");
@@ -603,7 +612,7 @@ export async function research(args: {
     }
 
     if (sources.googleAi) {
-      tasks.googleAi = googleSearchAiMode({ query, recency })
+      tasks.googleAi = googleSearchAiMode({ query, recency, format: "json" })
         .then(parseToolResult)
         .catch((err) => ({ error: formatError(err) }));
     }

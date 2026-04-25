@@ -9,7 +9,7 @@ browserManager.setHeadless(false);
 
 async function testAiMode() {
   console.log("=== Test AI Mode References ===\n");
-  const result = await googleSearchAiMode({ query: "what is MCP model context protocol" });
+  const result = await googleSearchAiMode({ query: "what is MCP model context protocol", format: "json" });
 
   if (result.isError) {
     console.error("AI Mode failed:", result.content[0].text);
@@ -35,7 +35,7 @@ async function testAiMode() {
 
 async function testAiOverview() {
   console.log("\n=== Test AI Overview/Search References ===\n");
-  const result = await googleSearchAiOverview({ query: "what is MCP model context protocol" });
+  const result = await googleSearchAiOverview({ query: "what is MCP model context protocol", format: "json" });
 
   if (result.isError) {
     console.error("AI Overview failed:", result.content[0].text);

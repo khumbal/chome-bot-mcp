@@ -183,6 +183,7 @@ class BrowserManager {
   // Ephemeral browser (DDG, news, web-fetch) is headless by default since auth is not needed.
   // Set EPHEMERAL_HEADLESS=false only when you need visible windows for manual browser tools.
   private ephemeralHeadless: boolean = true;
+  private sharedBrowserClosing = false;
   private shuttingDown = false;
 
   // Mutexes to prevent concurrent browser/session creation races
@@ -223,16 +224,13 @@ class BrowserManager {
       this.browser.on("disconnected", () => {
         if (this.shuttingDown) {
           log.info("Shared browser disconnected during shutdown");
+          this.browser = null;
+        } else if (this.sharedBrowserClosing || this.browser === null) {
+          log.debug("Shared browser closed after idle cleanup");
         } else {
           log.warn("Shared browser disconnected unexpectedly");
-        }
-        this.browser = null;
-        // Remove all non-persistent sessions (collect IDs first to avoid delete-during-iterate)
-        const toRemove = Array.from(this.sessions.entries())
-          .filter(([, s]) => !s.persistent)
-          .map(([id]) => id);
-        for (const id of toRemove) {
-          this.sessions.delete(id);
+          this.browser = null;
+          this.removeSessionsWhere((session) => !session.persistent);
         }
       });
 
@@ -385,10 +383,7 @@ class BrowserManager {
     this.shuttingDown = true;
     log.info("Shutting down browser manager");
 
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
+    this.stopCleanupLoop();
 
     // Close all sessions in parallel
     const destroyPromises = Array.from(this.sessions.keys()).map((id) =>
@@ -398,14 +393,7 @@ class BrowserManager {
 
     await this.closePersistentContext();
 
-    if (this.browser) {
-      try {
-        await this.browser.close();
-      } catch {
-        // Already closed
-      }
-      this.browser = null;
-    }
+    await this.closeSharedBrowser();
 
     log.info("Browser manager shut down");
   }
@@ -493,12 +481,53 @@ class BrowserManager {
   }
 
   private countPersistentSessions(): number {
-    return Array.from(this.sessions.values()).filter((session) => session.persistent).length;
+    return this.countSessions((session) => session.persistent);
+  }
+
+  private countEphemeralSessions(): number {
+    return this.countSessions((session) => !session.persistent);
+  }
+
+  private countSessions(predicate: (session: Session) => boolean): number {
+    let count = 0;
+    for (const session of this.sessions.values()) {
+      if (predicate(session)) count += 1;
+    }
+    return count;
+  }
+
+  private removeSessionsWhere(predicate: (session: Session) => boolean): void {
+    for (const [id, session] of this.sessions) {
+      if (predicate(session)) {
+        this.sessions.delete(id);
+      }
+    }
   }
 
   private startCleanupLoop(): void {
     if (this.cleanupTimer) return;
     this.cleanupTimer = setInterval(() => this.reapStale(), 15_000);
+  }
+
+  private stopCleanupLoop(): void {
+    if (!this.cleanupTimer) return;
+    clearInterval(this.cleanupTimer);
+    this.cleanupTimer = null;
+  }
+
+  private async closeSharedBrowser(): Promise<void> {
+    if (!this.browser) return;
+
+    const browser = this.browser;
+    this.browser = null;
+    this.sharedBrowserClosing = true;
+    try {
+      await browser.close();
+    } catch {
+      // Already closed
+    } finally {
+      this.sharedBrowserClosing = false;
+    }
   }
 
   private async reapStale(): Promise<void> {
@@ -514,19 +543,12 @@ class BrowserManager {
       }
     }
 
-    // Auto-close browser when no sessions remain
-    if (this.sessions.size === 0 && this.browser) {
+    // Auto-close shared browser when no ephemeral sessions remain.
+    // Persistent sessions use a separate persistent context and should not keep it alive.
+    if (this.countEphemeralSessions() === 0 && this.browser) {
       log.debug("No active sessions — closing browser");
-      if (this.cleanupTimer) {
-        clearInterval(this.cleanupTimer);
-        this.cleanupTimer = null;
-      }
-      try {
-        await this.browser.close();
-      } catch {
-        // Already closed
-      }
-      this.browser = null;
+      if (this.sessions.size === 0) this.stopCleanupLoop();
+      await this.closeSharedBrowser();
     }
   }
 

@@ -46,8 +46,8 @@ The server communicates over **stdio** (stdin/stdout) using the Model Context Pr
 
 | Tool | Arguments | Description |
 |------|-----------|-------------|
-| `google_search_ai_overview` | `query` | Search Google and extract the AI Overview summary. Falls back to top organic results if AI Overview is unavailable. Returns structured JSON. |
-| `google_search_ai_mode` | `query` | Search Google via AI Mode (`udm=50`) for a direct AI-generated answer. Returns structured JSON. |
+| `google_search_ai_overview` | `query`, `recency?`, `format?` | Search Google and extract the AI Overview summary. Falls back to AI Mode, then top organic results. Returns Markdown by default; set `format` to `json` for structured output. |
+| `google_search_ai_mode` | `query`, `recency?`, `format?` | Search Google via AI Mode (`udm=50`) for a direct AI-generated answer. Returns Markdown by default; set `format` to `json` for structured output. |
 
 ### Gemini
 
