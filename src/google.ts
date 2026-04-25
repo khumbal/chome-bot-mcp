@@ -23,11 +23,21 @@ export interface Reference {
 
 export type GoogleSource = "google_ai_overview" | "google_ai_mode" | "google_search_results";
 export type GoogleResponseFormat = "json" | "markdown";
+export type GoogleFollowUpMode = "always" | "if_short";
 
 export interface GoogleSearchArgs {
   query?: unknown;
   recency?: unknown;
   format?: unknown;
+  followUpPrompt?: unknown;
+  followUpMode?: unknown;
+  minContentLength?: unknown;
+}
+
+export interface GoogleRefinement {
+  prompt: string;
+  content: string;
+  timedOut?: boolean;
 }
 
 export interface GoogleResultPayload {
@@ -35,6 +45,7 @@ export interface GoogleResultPayload {
   query: string;
   content: string;
   references: Reference[];
+  refinements?: GoogleRefinement[];
   note?: string;
 }
 
@@ -46,11 +57,19 @@ interface RawReference {
 interface AiModeWaitResult {
   content: string | null;
   captchaMessage?: string;
+  errorMessage?: string;
   timedOut: boolean;
 }
 
 interface AiModeSearchOptions {
   fallbackOnEmpty?: boolean;
+  followUp?: AiModeFollowUpConfig;
+}
+
+export interface AiModeFollowUpConfig {
+  prompt: string;
+  mode: GoogleFollowUpMode;
+  minContentLength: number;
 }
 
 // Mutex prevents concurrent Google searches from interfering
@@ -65,6 +84,14 @@ const GOOGLE_SEARCH_URL = "https://www.google.com/search";
 const MIN_EXTRACTED_TEXT_LENGTH = 30;
 const GOOGLE_NAVIGATION_ATTEMPTS = 2;
 const GOOGLE_RESPONSE_FORMATS = ["json", "markdown"] as const;
+const GOOGLE_FOLLOW_UP_MODES = ["always", "if_short"] as const;
+const DEFAULT_FOLLOW_UP_MIN_CONTENT_LENGTH = 1_200;
+const MAX_FOLLOW_UP_PROMPT_LENGTH = 2_000;
+const AI_MODE_ERROR_PATTERNS = [
+  "something went wrong and the content wasn't generated",
+  "something went wrong",
+  "content wasn't generated",
+] as const;
 
 const GOOGLE_RECENCY_PARAM: Record<GoogleRecency, string> = {
   day: "qdr:d",
@@ -86,6 +113,49 @@ function validateResponseFormat(value: unknown): GoogleResponseFormat {
     return value as GoogleResponseFormat;
   }
   throw new ValidationError(`"format" must be one of: json, markdown.`);
+}
+
+function validateFollowUpConfig(args: GoogleSearchArgs): AiModeFollowUpConfig | undefined {
+  if (args.followUpPrompt === undefined) return undefined;
+
+  const prompt = validateNonEmpty(args.followUpPrompt, "followUpPrompt");
+  if (prompt.length > MAX_FOLLOW_UP_PROMPT_LENGTH) {
+    throw new ValidationError(`"followUpPrompt" must be ${MAX_FOLLOW_UP_PROMPT_LENGTH} characters or fewer.`);
+  }
+
+  const mode = validateFollowUpMode(args.followUpMode);
+  const minContentLength = validateMinContentLength(args.minContentLength);
+
+  return { prompt, mode, minContentLength };
+}
+
+function validateFollowUpMode(value: unknown): GoogleFollowUpMode {
+  if (value === undefined) return "always";
+  if (typeof value === "string" && (GOOGLE_FOLLOW_UP_MODES as readonly string[]).includes(value)) {
+    return value as GoogleFollowUpMode;
+  }
+  throw new ValidationError(`"followUpMode" must be one of: always, if_short.`);
+}
+
+function validateMinContentLength(value: unknown): number {
+  if (value === undefined) return DEFAULT_FOLLOW_UP_MIN_CONTENT_LENGTH;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new ValidationError(`"minContentLength" must be a finite number.`);
+  }
+  return Math.max(MIN_EXTRACTED_TEXT_LENGTH, Math.min(Math.floor(value), MAX_CONTENT_LENGTH));
+}
+
+export function shouldRunAiModeFollowUp(content: string, config: AiModeFollowUpConfig): boolean {
+  if (config.mode === "always") return true;
+  return normalizeExtractedText(content).length < config.minContentLength;
+}
+
+export function detectAiModeErrorText(text: string): string | null {
+  const normalized = normalizeExtractedText(text).toLowerCase();
+  if (AI_MODE_ERROR_PATTERNS.some((pattern) => normalized.includes(pattern))) {
+    return "Google AI Mode returned an internal error and did not generate content.";
+  }
+  return null;
 }
 
 export function buildGoogleSearchUrl(query: string, recency: GoogleRecency, directAiMode = false): string {
@@ -113,6 +183,17 @@ export function googleResultToMarkdown(payload: GoogleResultPayload): string {
 
   if (payload.note) {
     lines.push("", `> ${payload.note}`);
+  }
+
+  if (payload.refinements && payload.refinements.length > 0) {
+    lines.push("", "## Follow-up Expansion");
+    payload.refinements.forEach((refinement, index) => {
+      const heading = payload.refinements?.length === 1 ? "" : ` ${index + 1}`;
+      lines.push("", `### Prompt${heading}`, "", refinement.prompt, "", `### Expanded Answer${heading}`, "", refinement.content.trim());
+      if (refinement.timedOut) {
+        lines.push("", "> Follow-up response did not stabilize before timeout; returning the latest captured content.");
+      }
+    });
   }
 
   if (payload.references.length > 0) {
@@ -330,37 +411,160 @@ async function runAiModeSearch(
   format: GoogleResponseFormat,
   options: AiModeSearchOptions = {},
 ): Promise<ToolResult | null> {
-  const aiModeUrl = buildGoogleSearchUrl(query, recency, true);
   log.info("Google AI Mode search", { query, recency });
+
+  const primary = await runAiModeSearchAttempt(query, recency, format, options);
+  if (!primary.retryWithoutRecency) return primary.result;
+
+  log.warn("Retrying Google AI Mode without recency filter", { query, recency, reason: primary.retryReason });
+  const retry = await runAiModeSearchAttempt(query, "any", format, options);
+  if (retry.retryWithoutRecency) {
+    if (options.fallbackOnEmpty) return null;
+    return fail(retry.retryReason ?? "Google AI Mode returned no content.");
+  }
+  return retry.result;
+}
+
+async function runAiModeSearchAttempt(
+  query: string,
+  recency: GoogleRecency,
+  format: GoogleResponseFormat,
+  options: AiModeSearchOptions,
+): Promise<{ result: ToolResult | null; retryWithoutRecency: boolean; retryReason?: string }> {
+  const aiModeUrl = buildGoogleSearchUrl(query, recency, true);
 
   const page = await loadGoogleUrl(aiModeUrl, "ai_mode");
 
   const captchaResult = await detectCaptcha(page);
   if (captchaResult) {
     log.warn("Google CAPTCHA detected", { url: page.url() });
-    return fail(captchaResult);
+    return { result: fail(captchaResult), retryWithoutRecency: false };
   }
 
   const result = await waitForAiModeResponse(page);
-  if (result.captchaMessage) return fail(result.captchaMessage);
+  if (result.captchaMessage) return { result: fail(result.captchaMessage), retryWithoutRecency: false };
+  if (result.errorMessage) {
+    return {
+      result: null,
+      retryWithoutRecency: recency !== "any",
+      retryReason: result.errorMessage,
+    };
+  }
 
   if (!result.content) {
-    if (options.fallbackOnEmpty) return null;
-    return fail(
+    const reason =
       `AI Mode returned no content for: "${query}". ` +
-      "Google may not support AI Mode for this query or region.",
-    );
+      "Google may not support AI Mode for this query or region.";
+
+    if (recency !== "any") {
+      return { result: null, retryWithoutRecency: true, retryReason: reason };
+    }
+    if (options.fallbackOnEmpty) return { result: null, retryWithoutRecency: false };
+    return { result: fail(reason), retryWithoutRecency: false };
   }
 
   const references = await extractAiModeReferences(page);
+  const refinements: GoogleRefinement[] = [];
+  const notes: string[] = [];
 
-  return toolResponse({
+  if (result.timedOut) {
+    notes.push("AI Mode response did not stabilize before timeout; returning the latest captured content.");
+  }
+
+  if (options.followUp && shouldRunAiModeFollowUp(result.content, options.followUp)) {
+    const followUp = await runAiModeFollowUp(page, options.followUp, result.content);
+    if (followUp.refinement) {
+      refinements.push(followUp.refinement);
+    }
+    if (followUp.note) {
+      notes.push(followUp.note);
+    }
+  }
+
+  const response = toolResponse({
     source: "google_ai_mode",
     query,
     content: truncate(result.content),
     references,
-    note: result.timedOut ? "AI Mode response did not stabilize before timeout; returning the latest captured content." : undefined,
+    refinements: refinements.length > 0 ? refinements : undefined,
+    note: notes.length > 0 ? notes.join(" ") : undefined,
   }, format);
+
+  return { result: response, retryWithoutRecency: false };
+}
+
+async function runAiModeFollowUp(
+  page: Page,
+  config: AiModeFollowUpConfig,
+  previousContent: string,
+): Promise<{ refinement?: GoogleRefinement; note?: string }> {
+  try {
+    const sent = await sendAiModeFollowUp(page, config.prompt);
+    if (!sent) {
+      return { note: "Follow-up prompt could not be sent because the AI Mode input was not found." };
+    }
+
+    const result = await waitForAiModeResponse(page, previousContent);
+    if (result.captchaMessage) return { note: result.captchaMessage };
+    if (result.errorMessage) return { note: result.errorMessage };
+    if (!result.content || result.content === previousContent) {
+      return { note: "Follow-up prompt was sent, but no expanded AI Mode content was captured." };
+    }
+
+    return {
+      refinement: {
+        prompt: config.prompt,
+        content: truncate(result.content),
+        timedOut: result.timedOut || undefined,
+      },
+    };
+  } catch (err) {
+    return { note: `Follow-up expansion failed: ${formatError(err)}` };
+  }
+}
+
+async function sendAiModeFollowUp(page: Page, prompt: string): Promise<boolean> {
+  const inputSelectors = [
+    'textarea[aria-label*="Ask"]',
+    'textarea[placeholder*="Ask"]',
+    // Thai variants of "Ask".
+    'textarea[aria-label*="ถาม"]',
+    'textarea[placeholder*="ถาม"]',
+    'div[contenteditable="true"]',
+    "textarea",
+  ];
+
+  for (const selector of inputSelectors) {
+    const input = page.locator(selector).last();
+    const visible = await input.isVisible({ timeout: 2_000 }).catch(() => false);
+    if (!visible) continue;
+
+    await input.click();
+    const tagName = await input.evaluate((el) => el.tagName.toLowerCase()).catch(() => "div");
+
+    if (tagName === "textarea" || tagName === "input") {
+      await input.fill(prompt);
+    } else {
+      await page.keyboard.press("Meta+A");
+      await page.keyboard.press("Backspace");
+      await page.keyboard.insertText(prompt);
+    }
+
+    const sendButton = page
+      .locator('button[aria-label*="Send"], button[aria-label*="ส่ง"], button[type="submit"]')
+      .last();
+    const hasSendButton = await sendButton.isVisible({ timeout: 1_500 }).catch(() => false);
+    if (hasSendButton) {
+      await sendButton.click();
+    } else {
+      await page.keyboard.press("Enter");
+    }
+
+    log.debug("AI Mode follow-up prompt sent", { chars: prompt.length });
+    return true;
+  }
+
+  return false;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -578,10 +782,11 @@ export async function googleSearchAiMode(args: GoogleSearchArgs): Promise<ToolRe
     const query = validateNonEmpty(args.query, "query");
     const recency = validateRecency(args.recency);
     const format = validateResponseFormat(args.format);
+    const followUp = validateFollowUpConfig(args);
     const release = await googleMutex.acquire();
 
     try {
-      return await runAiModeSearch(query, recency, format) ?? fail(
+      return await runAiModeSearch(query, recency, format, { followUp }) ?? fail(
         `AI Mode returned no content for: "${query}". ` +
         "Google may not support AI Mode for this query or region.",
       );
@@ -594,7 +799,7 @@ export async function googleSearchAiMode(args: GoogleSearchArgs): Promise<ToolRe
   }
 }
 
-async function waitForAiModeResponse(page: Page): Promise<AiModeWaitResult> {
+async function waitForAiModeResponse(page: Page, previousContent?: string): Promise<AiModeWaitResult> {
   const startTime = Date.now();
   let lastText = "";
   let stableCount = 0;
@@ -617,6 +822,10 @@ async function waitForAiModeResponse(page: Page): Promise<AiModeWaitResult> {
 
     const text = await extractBestText(page, selectors);
     if (!text) continue;
+    if (previousContent && text === previousContent) continue;
+
+    const errorMessage = detectAiModeErrorText(text);
+    if (errorMessage) return { content: null, errorMessage, timedOut: false };
 
     if (text === lastText) {
       stableCount++;
@@ -688,6 +897,20 @@ export const googleToolDefinitions = [
           type: "string",
           enum: ["markdown", "json"],
           description: "Response format. Default: 'markdown'. Use 'json' for structured parsing.",
+        },
+        followUpPrompt: {
+          type: "string",
+          description: "Optional prompt to send after the first AI Mode answer when you want a more detailed or corrected response.",
+        },
+        followUpMode: {
+          type: "string",
+          enum: ["always", "if_short"],
+          description: "When to send followUpPrompt. Default: 'always'. Use 'if_short' to send only when the first answer is shorter than minContentLength.",
+        },
+        minContentLength: {
+          type: "number",
+          description:
+            "Minimum first-answer length used by followUpMode='if_short' (default: 1200; capped by the internal maximum limit).",
         },
       },
       required: ["query"],

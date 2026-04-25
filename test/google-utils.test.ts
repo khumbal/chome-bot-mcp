@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildGoogleSearchUrl,
+  detectAiModeErrorText,
   googleResultToMarkdown,
   normalizeExtractedText,
   normalizeReferenceUrl,
+  shouldRunAiModeFollowUp,
 } from "../src/google.js";
 
 describe("Google utility helpers", () => {
@@ -51,6 +53,13 @@ describe("Google utility helpers", () => {
     expect(normalizeReferenceUrl("javascript:alert(1)")).toBeNull();
   });
 
+  test("detects Google AI Mode internal error text", () => {
+    expect(detectAiModeErrorText("Something went wrong and the content wasn't generated.")).toBe(
+      "Google AI Mode returned an internal error and did not generate content.",
+    );
+    expect(detectAiModeErrorText("Useful AI Mode answer content.")).toBeNull();
+  });
+
   test("renders Google result payloads as readable Markdown", () => {
     const markdown = googleResultToMarkdown({
       source: "google_ai_mode",
@@ -60,6 +69,12 @@ describe("Google utility helpers", () => {
         { title: "Model Context Protocol", url: "https://modelcontextprotocol.io/" },
         { title: "Docs [overview]", url: "https://example.com/docs" },
       ],
+      refinements: [
+        {
+          prompt: "Please expand with implementation details.",
+          content: "A fuller answer should cover clients, servers, tools, and resources.",
+        },
+      ],
       note: "AI Mode response did not stabilize before timeout; returning the latest captured content.",
     });
 
@@ -67,7 +82,30 @@ describe("Google utility helpers", () => {
     expect(markdown).toContain("**Query:** model context protocol");
     expect(markdown).toContain("MCP connects models to external tools and context.");
     expect(markdown).toContain("> AI Mode response did not stabilize before timeout");
+    expect(markdown).toContain("## Follow-up Expansion");
+    expect(markdown).toContain("Please expand with implementation details.");
+    expect(markdown).toContain("A fuller answer should cover clients, servers, tools, and resources.");
     expect(markdown).toContain("1. [Model Context Protocol](https://modelcontextprotocol.io/)");
     expect(markdown).toContain("2. [Docs \\[overview\\]](https://example.com/docs)");
+  });
+
+  test("decides when AI Mode follow-up should run", () => {
+    expect(shouldRunAiModeFollowUp("short answer", {
+      prompt: "Expand this answer.",
+      mode: "always",
+      minContentLength: 1000,
+    })).toBe(true);
+
+    expect(shouldRunAiModeFollowUp("short answer", {
+      prompt: "Expand this answer.",
+      mode: "if_short",
+      minContentLength: 1000,
+    })).toBe(true);
+
+    expect(shouldRunAiModeFollowUp("This answer is long enough for the configured threshold.", {
+      prompt: "Expand this answer.",
+      mode: "if_short",
+      minContentLength: 10,
+    })).toBe(false);
   });
 });
